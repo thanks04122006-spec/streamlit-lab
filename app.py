@@ -94,3 +94,120 @@ def aggregate_results(judgments):
         raise ValueError("심판 3명의 판정이 모두 있어야 합산할 수 있습니다.")
     votes = Counter(item["winner"] for item in judgments)
     highest = max(votes.values())
+    leaders = [winner for winner, count in votes.items() if count == highest]
+    return (leaders[0] if len(leaders) == 1 else "무승부"), votes
+
+
+def show_message(message):
+    with st.chat_message(message["name"], avatar=AVATARS[message["name"]]):
+        st.caption(f"{message['stage']} · {message['name']}")
+        st.write(message["text"])
+
+
+st.set_page_config(page_title="AI 토론장", page_icon="⚖️")
+st.title("⚖️ AI 토론장")
+st.caption("찬성봇과 반대봇의 토론을 심판 3명이 독립적으로 평가합니다.")
+
+try:
+    client = get_client()
+except (KeyError, FileNotFoundError):
+    st.error('🔑 .streamlit/secrets.toml 또는 배포 앱의 Secrets에 GEMINI_API_KEY를 설정하세요.')
+    st.stop()
+except Exception:
+    logging.exception("Gemini 클라이언트 초기화 실패")
+    st.error("Gemini 클라이언트를 초기화하지 못했습니다. API 키와 SDK 설치 상태를 확인하세요.")
+    st.stop()
+
+# ---------- ① 사이드바 — 토론 준비 ----------
+with st.sidebar:
+    st.header("🎛️ 토론 준비")
+    with st.form("debate_settings"):
+        topic = st.text_area("토론 주제", "학교에서 AI 활용 과제를 허용해야 한다.")
+        rounds = st.slider("추가 공방 라운드", 1, 5, 2)
+        pro_style = st.selectbox("찬성봇 말투", ["차분하고 논리적인", "친근하고 쉬운", "단호하고 간결한"])
+        con_style = st.selectbox("반대봇 말투", ["단호하고 간결한", "차분하고 논리적인", "친근하고 쉬운"])
+        st.caption("첫 찬성 발언 후, 라운드마다 반대 → 찬성 순서로 한 번씩 발언합니다.")
+        start = st.form_submit_button("🚀 토론 시작", type="primary")
+    st.caption(f"정상 완료 시 모델 요청: 1 + 2 × {rounds} + 3 = {1 + 2 * rounds + 3}회")
+    st.caption("오류에 따른 SDK 자동 재시도는 별도입니다.")
+    if st.button("🗑️ 결과 초기화"):
+        st.session_state.pop("debate", None)
+        st.rerun()
+
+# ---------- ② 토론 진행 ----------
+if start:
+    if not topic.strip():
+        st.warning("토론 주제를 입력하세요.")
+    else:
+        st.session_state.debate = {
+            "topic": topic.strip(), "messages": [], "judgments": [],
+            "complete": False, "error": None,
+        }
+        run = st.session_state.debate
+        histories = {"찬성봇": [], "반대봇": []}
+        prompts = {
+            "찬성봇": build_prompt("찬성", "찬성봇", run["topic"], pro_style),
+            "반대봇": build_prompt("반대", "반대봇", run["topic"], con_style),
+        }
+        total = 1 + 2 * rounds + len(JUDGES)
+        progress = st.progress(0, text="토론 준비 중…")
+        completed = 0
+        # 첫 찬성 발언 1회 + 각 라운드의 반대/찬성 발언 2회
+        schedule = [("찬성봇", "첫 발언")]
+        for number in range(1, rounds + 1):
+            schedule.extend([("반대봇", f"{number}라운드"), ("찬성봇", f"{number}라운드")])
+        try:
+            heard = START_LINE
+            for name, stage in schedule:
+                with st.spinner(f"{stage} · {name} 발언 중…"):
+                    heard = debate_turn(client, histories[name], prompts[name], heard)
+                message = {"name": name, "stage": stage, "text": heard}
+                run["messages"].append(message)
+                show_message(message)
+                completed += 1
+                progress.progress(completed / total, text=f"{completed}/{total} 완료")
+
+            # ---------- ③ 심판 3명의 독립 판정 ----------
+            for name, criterion in JUDGES:
+                with st.spinner(f"{name} 판정 중…"):
+                    judgment = judge_debate(client, name, criterion, run["topic"], run["messages"])
+                run["judgments"].append(judgment)
+                completed += 1
+                progress.progress(completed / total, text=f"{completed}/{total} 완료")
+            run["complete"] = True
+        except Exception:
+            logging.exception("토론 또는 심판 판정 실패")
+            run["error"] = "요청에 실패했습니다. API 키·모델 접근 권한·할당량·네트워크를 확인한 뒤 다시 시작하세요."
+        st.rerun()
+
+# ---------- ④ 판정 보여 주기 ----------
+run = st.session_state.get("debate")
+if run:
+    st.subheader(f"💬 주제: {run['topic']}")
+    for message in run["messages"]:
+        show_message(message)
+    if run["error"]:
+        st.error(run["error"])
+        st.info("완료된 발언과 판정은 아래에 보존됩니다. 3명 모두 판정하기 전에는 최종 결과를 내지 않습니다.")
+    if run["complete"]:
+        winner, votes = aggregate_results(run["judgments"])
+        st.subheader("🏆 최종 판정")
+        if winner == "무승부":
+            st.info("최종 결과: 무승부")
+        else:
+            st.success(f"최종 결과: {winner} 측 승리!")
+        for column, label in zip(st.columns(3), ["찬성", "반대", "무승부"]):
+            column.metric(f"{label} 표", votes[label])
+        st.caption("최다 득표 결과를 채택합니다. 세 결과가 각각 1표이면 무승부입니다.")
+    if run["judgments"]:
+        st.subheader("🧑‍⚖️ 심판별 의견")
+        for result in run["judgments"]:
+            with st.expander(f"{result['name']} — {result['winner']}", expanded=True):
+                st.write(result["reason"])
+                st.markdown("**가장 설득력 있던 문장**")
+                if result["quote_valid"]:
+                    st.write(result["best_sentence"])
+                else:
+                    st.warning("심판이 제시한 문장이 실제 발언과 일치하지 않아 표시하지 않습니다.")
+else:
+    st.info("왼쪽 사이드바에서 주제와 라운드를 정한 뒤 토론을 시작하세요.")
