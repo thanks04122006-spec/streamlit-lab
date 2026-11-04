@@ -104,7 +104,7 @@ def show_message(message):
         st.write(message["text"])
 
 
-st.set_page_config(page_title="AI 토론장", page_icon="⚖️")
+st.set_page_config(page_title="AI 토론장(이가영)", page_icon="⚖️")
 st.title("⚖️ AI 토론장")
 st.caption("찬성봇과 반대봇의 토론을 심판 3명이 독립적으로 평가합니다.")
 
